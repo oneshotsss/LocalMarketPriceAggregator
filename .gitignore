@@ -1,0 +1,32 @@
+# Віртуальне середовище
+.venv/
+env/
+ENV/
+
+# Python кеш
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Бази даних
+*.db
+*.sqlite3
+
+# IDE файли
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Логи
+*.log
+
+# Docker
+docker-compose.override.yml
+*.env
+
+# MacOS
+.DS_Store
+
+test.py

@@ -1,20 +1,23 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
-from app.db.session import engine, SessionLocal
+from app.db.session import SessionLocal, engine
 from app.models.base_class import Base
-from app import models
+from app.models.item import Item
+from app.models.source import Source
+from app import schemas
 
-app = FastAPI()
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
-@app.on_event('startup')
+app = FastAPI(title="Local Market Price Aggregator")
+
+# --- Створюємо таблиці при старті ---
+@app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
 
-@app.get('/')
-def root():
-    return {'status': "ok"}
-
-# Залежність для DB
+# --- DB dependency ---
 def get_db():
     db = SessionLocal()
     try:
@@ -22,38 +25,70 @@ def get_db():
     finally:
         db.close()
 
-@app.post('/products')
-def create_product(name: str, price: float, db: Session = Depends(get_db)):
-    db_product = db.query(models.Product).filter(models.Product.name == name).first()
-    if db_product:
-        raise HTTPException(status_code=400, detail="Product already exists")
-    new_product = models.Product(name=name, price=price)
-    db.add(new_product)
+# --- SOURCES ---
+@app.post("/sources", response_model=schemas.SourceRead)
+def create_source(source: schemas.SourceCreate, db: Session = Depends(get_db)):
+    db_source = Source(**source.dict())
+    db.add(db_source)
     db.commit()
-    db.refresh(new_product)
-    return {"id": new_product.id, "name": new_product.name, "price": new_product.price}
+    db.refresh(db_source)
+    return db_source
 
-@app.get('/products')
-def read_products(db: Session = Depends(get_db)):
-    products = db.query(models.Product).all()
-    return [{"id": p.id, "name": p.name, "price": p.price} for p in products]
+@app.get("/sources", response_model=list[schemas.SourceRead])
+def read_sources(db: Session = Depends(get_db)):
+    return db.query(Source).all()
 
-@app.put('/products/{product_id}')
-def update_product(product_id: int, name: str, price: float, db: Session = Depends(get_db)):
-    db_product = db.query(models.Product).get(product_id)
-    if not db_product:
-        raise HTTPException(status_code=404, detail="Product not found")
-    db_product.name = name
-    db_product.price = price
+# --- ITEMS ---
+@app.get("/items", response_model=list[schemas.ItemRead])
+def read_items(source_id: int = None, db: Session = Depends(get_db)):
+    query = db.query(Item)
+    if source_id:
+        query = query.filter(Item.source_id == source_id)
+    return query.all()
+
+# --- PARSER однієї сторінки ---
+def parse_page(url: str, source_id: int, db: Session):
+    r = requests.get(url)
+    if r.status_code != 200:
+        return 0
+    soup = BeautifulSoup(r.text, "html.parser")
+    products = soup.select("article.product_pod")
+    count = 0
+    for p in products:
+        try:
+            link_tag = p.select_one("h3 a")
+            link = urljoin(url, link_tag["href"])  # абсолютне посилання
+            price_str = p.select_one(".price_color").text.strip()  # "£53.74"
+            price = float(price_str[1:])
+        except:
+            continue
+        db_item = Item(price=price, link=link, source_id=source_id)
+        db.add(db_item)
+        count += 1
     db.commit()
-    db.refresh(db_product)
-    return {"id": db_product.id, "name": db_product.name, "price": db_product.price}
+    return count
 
-@app.delete('/products/{product_id}')
-def delete_product(product_id: int, db: Session = Depends(get_db)):
-    db_product = db.query(models.Product).get(product_id)
-    if not db_product:
-        raise HTTPException(status_code=404, detail="Product not found")
-    db.delete(db_product)
-    db.commit()
-    return {"detail": "Product deleted"}
+# --- PARSER всіх сторінок ---
+@app.post("/parse_all/{source_id}")
+def parse_all_pages(source_id: int, db: Session = Depends(get_db)):
+    source = db.query(Source).get(source_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    base_url = source.url
+    page_url = base_url
+    total_count = 0
+
+    while page_url:
+        count = parse_page(page_url, source_id, db)
+        total_count += count
+        # перевіряємо наявність "next" сторінки
+        r = requests.get(page_url)
+        soup = BeautifulSoup(r.text, "html.parser")
+        next_tag = soup.select_one(".next a")
+        if next_tag:
+            page_url = urljoin(base_url, next_tag["href"])
+        else:
+            page_url = None
+
+    return {"status": "ok", "total_parsed_items": total_count}
